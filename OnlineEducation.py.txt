@@ -1,0 +1,165 @@
+#ONLINE EDUCATION 
+
+import logging
+import os
+from datetime import datetime
+from flask import Flask, request, jsonify, render_template, session
+from flask_sqlalchemy import SQLAlchemy
+from flask_socketio import SocketIO, join_room, leave_room, send
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey
+from sqlalchemy.orm import relationship
+from pydantic import BaseModel
+import boto3
+import random
+import string
+
+# Initialize Flask app
+app = Flask(_name_)
+app.config['SECRET_KEY'] = 'your_secret_key'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///education_platform.db'
+db = SQLAlchemy(app)
+socketio = SocketIO(app)
+login_manager = LoginManager()
+login_manager.init_app(app)
+
+# Logging setup
+logging.basicConfig(filename='education_platform.log', level=logging.DEBUG, 
+                    format='%(asctime)s:%(levelname)s:%(message)s')
+
+# AWS S3 setup
+s3 = boto3.client('s3', aws_access_key_id='your_access_key', aws_secret_access_key='your_secret_key', region_name='your_region')
+
+# User model
+class User(db.Model, UserMixin):
+    id = Column(Integer, primary_key=True)
+    username = Column(String(50), unique=True, nullable=False)
+    password = Column(String(50), nullable=False)
+    role = Column(String(10), nullable=False)  # 'student' or 'teacher'
+
+# Course model
+class Course(db.Model):
+    id = Column(Integer, primary_key=True)
+    title = Column(String(100), nullable=False)
+    description = Column(Text, nullable=False)
+    created_by = Column(Integer, ForeignKey('user.id'), nullable=False)
+    creator = relationship('User', back_populates='courses')
+    students = relationship('User', secondary='course_students', back_populates='enrolled_courses')
+
+# Association table for many-to-many relationship between User and Course
+course_students = db.Table('course_students',
+    Column('course_id', Integer, ForeignKey('course.id')),
+    Column('student_id', Integer, ForeignKey('user.id'))
+)
+
+# Virtual Classroom model
+class VirtualClassroom(db.Model):
+    id = Column(Integer, primary_key=True)
+    course_id = Column(Integer, ForeignKey('course.id'), nullable=False)
+    classroom_link = Column(String(200), nullable=False)
+    start_time = Column(DateTime, nullable=False)
+    course = relationship('Course', back_populates='classrooms')
+
+Course.classrooms = relationship('VirtualClassroom', order_by=VirtualClassroom.id, back_populates='course')
+User.courses = relationship('Course', back_populates='creator')
+User.enrolled_courses = relationship('Course', secondary=course_students, back_populates='students')
+
+# Load user
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+# Data validation with Pydantic
+class UserModel(BaseModel):
+    username: str
+    password: str
+    role: str
+
+class CourseModel(BaseModel):
+    title: str
+    description: str
+    created_by: int
+
+class ClassroomModel(BaseModel):
+    course_id: int
+    classroom_link: str
+    start_time: datetime
+
+# Routes for user registration and login
+@app.route('/register', methods=['POST'])
+def register():
+    data = request.get_json()
+    user_data = UserModel(**data)
+    new_user = User(username=user_data.username, password=user_data.password, role=user_data.role)
+    db.session.add(new_user)
+    db.session.commit()
+    return jsonify({"message": "User registered successfully"}), 201
+
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    user = User.query.filter_by(username=data['username']).first()
+    if user and user.password == data['password']:
+        login_user(user)
+        return jsonify({"message": "Login successful"}), 200
+    return jsonify({"message": "Invalid credentials"}), 401
+
+# Route for course creation
+@app.route('/create_course', methods=['POST'])
+@login_required
+def create_course():
+    if current_user.role != 'teacher':
+        return jsonify({"message": "Unauthorized"}), 403
+    data = request.get_json()
+    course_data = CourseModel(**data)
+    new_course = Course(title=course_data.title, description=course_data.description, created_by=current_user.id)
+    db.session.add(new_course)
+    db.session.commit()
+    return jsonify({"message": "Course created successfully"}), 201
+
+# Route for enrolling in a course
+@app.route('/enroll/<int:course_id>', methods=['POST'])
+@login_required
+def enroll(course_id):
+    course = Course.query.get(course_id)
+    if course:
+        current_user.enrolled_courses.append(course)
+        db.session.commit()
+        return jsonify({"message": "Enrolled in course successfully"}), 200
+    return jsonify({"message": "Course not found"}), 404
+
+# Route for creating a virtual classroom
+@app.route('/create_classroom', methods=['POST'])
+@login_required
+def create_classroom():
+    if current_user.role != 'teacher':
+        return jsonify({"message": "Unauthorized"}), 403
+    data = request.get_json()
+    classroom_data = ClassroomModel(**data)
+    new_classroom = VirtualClassroom(course_id=classroom_data.course_id, classroom_link=classroom_data.classroom_link, start_time=classroom_data.start_time)
+    db.session.add(new_classroom)
+    db.session.commit()
+    return jsonify({"message": "Virtual classroom created successfully"}), 201
+
+# SocketIO event handlers for real-time communication
+@socketio.on('join')
+def handle_join(data):
+    room = data['room']
+    join_room(room)
+    send(f"{current_user.username} has joined the room.", room=room)
+
+@socketio.on('leave')
+def handle_leave(data):
+    room = data['room']
+    leave_room(room)
+    send(f"{current_user.username} has left the room.", room=room)
+
+@socketio.on('message')
+def handle_message(data):
+    room = data['room']
+    send(f"{current_user.username}: {data['message']}", room=room)
+
+# Main entry point
+if _name_ == '_main_':
+    db.create_all()
+    socketio.run(app, debug=True)
